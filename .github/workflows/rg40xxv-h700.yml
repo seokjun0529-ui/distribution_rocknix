@@ -1,0 +1,108 @@
+name: RG40XX V - H700 test build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rg40xxv-h700
+  cancel-in-progress: false
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Checkout selected source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+
+      - name: Prepare temporary build runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build-logs
+          git rev-parse HEAD | tee build-logs/source-commit.txt
+          # Remove unused SDKs only from this disposable GitHub-hosted runner.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          docker image prune --all --force
+          df -h | tee build-logs/disk-before.txt
+          free -h | tee build-logs/memory-before.txt
+
+      - name: Build upstream Docker environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --tag aurknix-h700-builder . 2>&1 | tee build-logs/docker.log
+
+      - name: Build H700 firmware with KrKr2
+        timeout-minutes: 315
+        shell: bash
+        run: |
+          set -euo pipefail
+          # KrKr2 is aarch64. Skip optional 32-bit emulators for this test build.
+          # Upstream krkr2-sa downloads the author's binary; it does not compile KrKr2.
+          docker run --rm --init --name aurknix-h700-build \
+            --user "$(id -u):$(id -g)" \
+            --volume "$PWD:$PWD" --workdir "$PWD" \
+            --env PROJECT=ROCKNIX --env DEVICE=H700 --env ARCH=aarch64 \
+            --env ENABLE_32BIT=false --env EMULATION_DEVICE=yes \
+            aurknix-h700-builder ./scripts/build_distro \
+            2>&1 | tee build-logs/build.log
+
+      - name: Verify image and included engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          engine=build.ROCKNIX-H700.aarch64/image/system/usr/config/krkr2/krkr2_sdl2
+          test -s "$engine"
+          file "$engine" | tee build-logs/engine-architecture.txt
+          readelf -h "$engine" | tee build-logs/engine-elf.txt
+          readelf -h "$engine" | grep -q AArch64
+          readelf -d "$engine" > build-logs/engine-needed.txt
+          readelf --version-info "$engine" > build-logs/engine-symbol-versions.txt
+          mkdir -p h700-output
+          while IFS= read -r -d '' image; do
+            cp "$image" h700-output/
+          done < <(find target release -maxdepth 1 -type f -name '*H700*.img.gz' -print0 2>/dev/null)
+          compgen -G 'h700-output/*.img.gz' > /dev/null
+          sha256sum h700-output/*.img.gz > h700-output/SHA256SUMS.txt
+          cp build-logs/source-commit.txt h700-output/
+          cat > h700-output/READ-BEFORE-FLASHING.txt <<'NOTE'
+          Experimental AURKNIX H700 build, intended for RG40XX V testing.
+          No physical device, boot, audio, input, or game test has been performed.
+          Use a separate test SD card. Keep the original ROCKNIX card unchanged.
+          Includes upstream KrKr2 prebuilt binary, not a new KrKr2 source build.
+          Optional 32-bit emulators are disabled.
+          NOTE
+
+      - name: Collect diagnostics even on failure
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build-logs
+          df -h > build-logs/disk-after.txt
+          if [ -d build.ROCKNIX-H700.aarch64/.threads ]; then
+            tar -czf build-logs/package-threads.tar.gz build.ROCKNIX-H700.aarch64/.threads
+          fi
+
+      - name: Save build diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: h700-build-logs
+          path: build-logs/
+          retention-days: 1
+
+      - name: Save experimental firmware
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rg40xxv-h700-experimental
+          path: h700-output/
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
